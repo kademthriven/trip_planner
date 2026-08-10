@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "riderData": {
+      "$userId": {
+        ".read": "auth != null && auth.uid === $userId",
+        ".write": "auth != null && auth.uid === $userId",
+        ".validate": "newData.hasChildren(['ownerId', 'updatedAt']) && newData.child('ownerId').val() === auth.uid"
+      }
+    },
+    ".read": false,
+    ".write": false
+  }
+}
