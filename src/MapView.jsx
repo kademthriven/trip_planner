@@ -172,7 +172,14 @@ const MapView = forwardRef(function MapView({ start, end, routes, selectedId, pl
     places.filter((place) => visibleCategories.has(place.category)).slice(0, 16).forEach((place) => {
       add(place, place.category, place.name, place.estimate ? `Est. ₹${place.estimate}` : place.type, () => onPlaceSelect?.(place))
     })
-    if (currentPosition) add(currentPosition, 'current', 'You are here', 'Live location')
+    if (currentPosition) {
+      add(
+        currentPosition,
+        'current',
+        'You are here',
+        `Live GPS · ±${Math.round(currentPosition.accuracy)} m`,
+      )
+    }
   }, [start, end, places, visibleCategories, currentPosition, onPlaceSelect])
 
   return <div className="live-map" ref={containerRef} />

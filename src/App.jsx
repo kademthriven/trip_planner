@@ -84,7 +84,6 @@ import {
   getDepartureWindows,
   getDestinationPhoto,
   getElevation,
-  getApproximateLocation,
   getNearbyPlaces,
   getRouteEssentials,
   getRoutes,
@@ -205,31 +204,85 @@ const formatNavDistance = (kilometres) =>
     ? `${Math.max(10, Math.round((kilometres * 1000) / 10) * 10)} m`
     : `${kilometres.toFixed(kilometres < 10 ? 1 : 0)} km`;
 
-const readBrowserPosition = (options) =>
-  new Promise((resolve, reject) =>
-    navigator.geolocation.getCurrentPosition(resolve, reject, options),
-  );
+// Windows Wi-Fi positioning commonly settles just above 100 m even when the
+// returned coordinates are usable for choosing a road and starting a route.
+const MAX_LIVE_LOCATION_ACCURACY_METERS = 150;
+
+const createLocationError = (code, message, accuracy) =>
+  Object.assign(new Error(message), { code, accuracy });
+
+const readAccurateBrowserPosition = () =>
+  new Promise((resolve, reject) => {
+    let bestPosition = null;
+    let lastError = null;
+    let settled = false;
+    let watchId;
+
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(deadline);
+      if (watchId != null) navigator.geolocation.clearWatch(watchId);
+      callback(value);
+    };
+
+    const deadline = window.setTimeout(() => {
+      if (bestPosition) {
+        finish(
+          reject,
+          createLocationError(
+            2,
+            `Location accuracy is only ±${Math.round(bestPosition.coords.accuracy)} m.`,
+            bestPosition.coords.accuracy,
+          ),
+        );
+        return;
+      }
+      finish(
+        reject,
+        lastError || createLocationError(3, "The GPS request timed out."),
+      );
+    }, 20000);
+
+    watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        if (
+          !bestPosition ||
+          position.coords.accuracy < bestPosition.coords.accuracy
+        ) {
+          bestPosition = position;
+        }
+        if (
+          Number.isFinite(position.coords.accuracy) &&
+          position.coords.accuracy <= MAX_LIVE_LOCATION_ACCURACY_METERS
+        ) {
+          finish(resolve, position);
+        }
+      },
+      (error) => {
+        lastError = error;
+        if (error?.code === 1) finish(reject, error);
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 },
+    );
+  });
+
+const readGeolocationPermission = async () => {
+  try {
+    return (
+      await navigator.permissions?.query({ name: "geolocation" })
+    )?.state;
+  } catch {
+    return "unknown";
+  }
+};
 
 const requestLiveOrigin = async () => {
   if (!window.isSecureContext)
     throw new Error("Precise location needs HTTPS or a localhost address.");
   if (!navigator.geolocation) throw new Error("Geolocation is unavailable.");
 
-  let rawPosition;
-  try {
-    rawPosition = await readBrowserPosition({
-      enableHighAccuracy: true,
-      maximumAge: 0,
-      timeout: 10000,
-    });
-  } catch (error) {
-    if (error?.code === 1) throw error;
-    rawPosition = await readBrowserPosition({
-      enableHighAccuracy: false,
-      maximumAge: 0,
-      timeout: 8000,
-    });
-  }
+  const rawPosition = await readAccurateBrowserPosition();
 
   const lat = rawPosition.coords.latitude;
   const lon = rawPosition.coords.longitude;
@@ -247,6 +300,7 @@ const requestLiveOrigin = async () => {
       accuracy: rawPosition.coords.accuracy,
       heading: rawPosition.coords.heading,
       speed: rawPosition.coords.speed,
+      source: "device",
     },
   };
 };
@@ -262,14 +316,97 @@ const requestStartupOrigin = () => {
   return startupLocationPromise;
 };
 
-const explainLocationError = (error) => {
-  if (!window.isSecureContext)
-    return "Precise GPS requires HTTPS or localhost.";
-  if (error?.code === 1)
-    return "Location permission is blocked in your browser.";
-  if (error?.code === 2) return "Your device could not determine its position.";
-  if (error?.code === 3) return "The GPS request timed out.";
-  return error?.message || "Precise location is unavailable.";
+const diagnoseLocationError = async (error) => {
+  if (!window.isSecureContext) {
+    return {
+      title: "Secure connection required",
+      detail: "Precise GPS requires HTTPS or localhost.",
+    };
+  }
+
+  const permissionsPolicy =
+    document.permissionsPolicy || document.featurePolicy;
+  if (
+    permissionsPolicy?.allowsFeature &&
+    !permissionsPolicy.allowsFeature("geolocation")
+  ) {
+    return {
+      title: "Location blocked by app preview",
+      detail:
+        "Open the app directly in a browser tab. The current embedded preview does not allow geolocation.",
+    };
+  }
+
+  const permissionState = await readGeolocationPermission();
+
+  if (Number.isFinite(error?.accuracy)) {
+    return {
+      title: "Waiting for accurate GPS",
+      detail: `The available fix is only accurate to ±${Math.round(error.accuracy)} m. A fix within ±${MAX_LIVE_LOCATION_ACCURACY_METERS} m is required before it can be used.`,
+    };
+  }
+  if (error?.code === 1 && permissionState === "granted") {
+    return {
+      title: "Precise position unavailable",
+      detail:
+        "Location is allowed, but this device did not provide coordinates. Use a GPS-capable phone or GPS receiver and retry.",
+    };
+  }
+  if (error?.code === 1) {
+    return {
+      title: "Location permission blocked",
+      detail:
+        permissionState === "prompt"
+          ? "Location permission has not been granted yet. Choose Allow when your browser asks."
+          : "Location permission is blocked for this site in your browser.",
+    };
+  }
+  if (error?.code === 2) {
+    return {
+      title: "GPS signal unavailable",
+      detail: "Your device could not determine its position. Move near a window and retry.",
+    };
+  }
+  if (error?.code === 3) {
+    return {
+      title: "GPS request timed out",
+      detail: "The GPS request timed out. Check device Location services and retry.",
+    };
+  }
+  return {
+    title: "Precise GPS unavailable",
+    detail: error?.message || "Precise location is unavailable.",
+  };
+};
+
+const navigationGpsIssue = async (error) => {
+  if (error?.code === 1) {
+    const permissionState = await readGeolocationPermission();
+    return {
+      status: permissionState === "granted" ? "unavailable" : "denied",
+      message:
+        permissionState === "granted"
+          ? "Location is allowed, but this device supplied no coordinates."
+          : "Location permission is blocked. Allow it in your browser's site settings, then restart navigation.",
+    };
+  }
+  if (error?.code === 2) {
+    return {
+      status: "unavailable",
+      message:
+        "A GPS signal is temporarily unavailable. Navigation will keep trying.",
+    };
+  }
+  if (error?.code === 3) {
+    return {
+      status: "timeout",
+      message: "GPS is taking longer than expected. Navigation will keep trying.",
+    };
+  }
+  return {
+    status: "unavailable",
+    message: "Live location is temporarily unavailable. Navigation will keep trying.",
+  };
 };
 
 function WeatherGlyph({ type, size = 18 }) {
@@ -380,6 +517,8 @@ function TripPlanner({ user, onLogout }) {
   const lastRerouteRef = useRef(0);
   const rideStartedRef = useRef(null);
   const placeLoadRef = useRef(0);
+  const searchAbortRef = useRef(null);
+  const lastGpsIssueRef = useRef(null);
   const [start, setStart] = useState(DEFAULT_START);
   const [end, setEnd] = useState(DEFAULT_END);
   const [startText, setStartText] = useState(() =>
@@ -644,19 +783,30 @@ function TripPlanner({ user, onLogout }) {
       const requestId = ++placeLoadRef.current;
       const placePromise = getNearbyPlaces(to);
       getDestinationPhoto(to)
-        .then(setDestinationPhoto)
-        .catch(() => setDestinationPhoto(null));
+        .then((photo) => {
+          if (requestId === placeLoadRef.current) setDestinationPhoto(photo);
+        })
+        .catch(() => {
+          if (requestId === placeLoadRef.current) setDestinationPhoto(null);
+        });
+      getWeather(to)
+        .then((weatherResult) => {
+          if (requestId !== placeLoadRef.current) return;
+          setWeather(weatherResult);
+          if (weatherResult[0]?.date) setDepartureDate(weatherResult[0].date);
+        })
+        .catch(() => {
+          if (requestId === placeLoadRef.current) setWeather([]);
+        });
       try {
-        const [routeResult, weatherResult] = await Promise.allSettled([
-          getRoutes(from, to, rideSettings),
-          getWeather(to),
-        ]);
         let loadedRoutes = [fallbackRoute];
-        if (routeResult.status === "fulfilled") {
-          loadedRoutes = routeResult.value;
+        try {
+          loadedRoutes = await getRoutes(from, to, rideSettings);
+          if (requestId !== placeLoadRef.current) return;
           setRoutes(loadedRoutes);
           setSelectedId(loadedRoutes[0].id);
-        } else {
+        } catch {
+          if (requestId !== placeLoadRef.current) return;
           const previewRoute = createFallbackRoute(from, to, rideSettings);
           loadedRoutes = [previewRoute];
           setRoutes([previewRoute]);
@@ -667,19 +817,24 @@ function TripPlanner({ user, onLogout }) {
         }
         setEssentialsLoading(true);
         getRouteEssentials(loadedRoutes[0])
-          .then(setRouteEssentials)
-          .catch(() => setRouteEssentials([]))
-          .finally(() => setEssentialsLoading(false));
-        if (weatherResult.status === "fulfilled") {
-          setWeather(weatherResult.value);
-          if (weatherResult.value[0]?.date)
-            setDepartureDate(weatherResult.value[0].date);
-        } else setWeather([]);
+          .then((items) => {
+            if (requestId === placeLoadRef.current) setRouteEssentials(items);
+          })
+          .catch(() => {
+            if (requestId === placeLoadRef.current) setRouteEssentials([]);
+          })
+          .finally(() => {
+            if (requestId === placeLoadRef.current) setEssentialsLoading(false);
+          });
         getElevation(loadedRoutes[0].geometry.coordinates)
-          .then(setElevation)
-          .catch(() => setElevation([]));
+          .then((values) => {
+            if (requestId === placeLoadRef.current) setElevation(values);
+          })
+          .catch(() => {
+            if (requestId === placeLoadRef.current) setElevation([]);
+          });
       } finally {
-        setLoading(false);
+        if (requestId === placeLoadRef.current) setLoading(false);
       }
       placePromise
         .then((items) => {
@@ -727,40 +882,18 @@ function TripPlanner({ user, onLogout }) {
         toast("Using your live location as the starting point.");
       } catch (gpsError) {
         if (!active) return;
-        const gpsReason = explainLocationError(gpsError);
+        const gpsIssue = await diagnoseLocationError(gpsError);
+        if (!active) return;
+        origin = DEFAULT_START;
+        setStart(DEFAULT_START);
+        setStartText(DEFAULT_START.name);
+        setCurrentPosition(null);
         setOriginStatus({
-          kind: "locating",
-          title: "GPS unavailable — locating by network",
-          detail: gpsReason,
+          kind: "error",
+          title: gpsIssue.title,
+          detail: `${gpsIssue.detail} Select your start manually or retry GPS.`,
         });
-        try {
-          const approximateOrigin = await getApproximateLocation();
-          if (!active) return;
-          origin = approximateOrigin.place;
-          setStart(approximateOrigin.place);
-          setStartText(approximateOrigin.place.name);
-          setCurrentPosition(approximateOrigin.position);
-          setOriginStatus({
-            kind: "approximate",
-            title: "Approximate network location",
-            detail: `${gpsReason} Tap Retry GPS for precise routing.`,
-          });
-          toast(
-            "Using your approximate network location. Retry GPS for precision.",
-          );
-        } catch {
-          if (!active) return;
-          origin = DEFAULT_START;
-          setStart(DEFAULT_START);
-          setStartText(DEFAULT_START.name);
-          setCurrentPosition(null);
-          setOriginStatus({
-            kind: "error",
-            title: "Live location unavailable",
-            detail: `${gpsReason} Bengaluru is only a temporary fallback.`,
-          });
-          toast("Could not detect your location. Check permission and retry GPS.");
-        }
+        toast("An accurate device location was not available. Select the start manually or retry GPS.");
       }
       if (active) loadTrip(origin, DEFAULT_END);
     };
@@ -773,29 +906,69 @@ function TripPlanner({ user, onLogout }) {
   }, []);
 
   useEffect(() => {
-    if (!activeSearch) return undefined;
+    if (!activeSearch) {
+      searchAbortRef.current?.abort();
+      return undefined;
+    }
     const query = activeSearch === "start" ? startText : endText;
-    if (query.trim().length < 2) return undefined;
+    if (query.trim().length < 2) {
+      searchAbortRef.current?.abort();
+      const resetTimer = window.setTimeout(() => {
+        setSuggestions([]);
+        setSearching(false);
+      }, 0);
+      return () => window.clearTimeout(resetTimer);
+    }
+    let controller;
     const timer = window.setTimeout(async () => {
+      searchAbortRef.current?.abort();
+      controller = new AbortController();
+      searchAbortRef.current = controller;
       setSearching(true);
       try {
         setSuggestions(
-          await geocode(query, activeSearch === "end" ? start : undefined),
+          await geocode(query, activeSearch === "end" ? start : undefined, {
+            signal: controller.signal,
+          }),
         );
-      } catch {
-        setSuggestions([]);
+      } catch (searchError) {
+        if (searchError.name !== "AbortError") setSuggestions([]);
       } finally {
-        setSearching(false);
+        if (searchAbortRef.current === controller) setSearching(false);
       }
-    }, 450);
-    return () => window.clearTimeout(timer);
+    }, 250);
+    return () => {
+      window.clearTimeout(timer);
+      controller?.abort();
+    };
   }, [activeSearch, startText, endText, start]);
 
   useEffect(() => {
     if (!riding) return undefined;
+    if (!window.isSecureContext) {
+      if (lastGpsIssueRef.current !== "insecure") {
+        lastGpsIssueRef.current = "insecure";
+        toast("Live GPS requires HTTPS or localhost.");
+      }
+      return undefined;
+    }
     if (!navigator.geolocation) return undefined;
     const watchId = navigator.geolocation.watchPosition(
       (position) => {
+        if (
+          !Number.isFinite(position.coords.accuracy) ||
+          position.coords.accuracy > MAX_LIVE_LOCATION_ACCURACY_METERS
+        ) {
+          setGpsStatus("weak");
+          if (lastGpsIssueRef.current !== "weak") {
+            lastGpsIssueRef.current = "weak";
+            toast(
+              `Waiting for accurate GPS (currently ±${Math.round(position.coords.accuracy || 0)} m).`,
+            );
+          }
+          return;
+        }
+        lastGpsIssueRef.current = null;
         setGpsStatus("live");
         setCurrentPosition({
           lat: position.coords.latitude,
@@ -803,13 +976,16 @@ function TripPlanner({ user, onLogout }) {
           heading: position.coords.heading,
           speed: position.coords.speed,
           accuracy: position.coords.accuracy,
+          source: "device",
         });
       },
-      () => {
-        setGpsStatus("denied");
-        toast(
-          "GPS permission was not granted. Navigation remains in route preview mode.",
-        );
+      async (error) => {
+        const issue = await navigationGpsIssue(error);
+        setGpsStatus(issue.status);
+        if (lastGpsIssueRef.current !== issue.status) {
+          lastGpsIssueRef.current = issue.status;
+          toast(issue.message);
+        }
       },
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 },
     );
@@ -1042,13 +1218,13 @@ function TripPlanner({ user, onLogout }) {
       loadTrip(liveOrigin.place, end);
     } catch (locationError) {
       setStartText(start.name);
-      const detail = explainLocationError(locationError);
+      const issue = await diagnoseLocationError(locationError);
       setOriginStatus({
         kind: "error",
-        title: "Precise GPS unavailable",
-        detail,
+        title: issue.title,
+        detail: issue.detail,
       });
-      toast(detail);
+      toast(issue.detail);
     }
   };
 
@@ -1336,12 +1512,15 @@ function TripPlanner({ user, onLogout }) {
     setRouteDetailsOpen(false);
     setMobilePanel(false);
     setFollowNavigation(true);
-    setGpsStatus(navigator.geolocation ? "requesting" : "unsupported");
-    setNavigationClock(Date.now());
-    setCurrentPosition(
-      (position) =>
-        position || { ...start, heading: null, speed: null, accuracy: null },
+    lastGpsIssueRef.current = null;
+    setGpsStatus(
+      !window.isSecureContext
+        ? "insecure"
+        : navigator.geolocation
+          ? "requesting"
+          : "unsupported",
     );
+    setNavigationClock(Date.now());
     lastSpokenRef.current = "";
     rideStartedRef.current = new Date().toISOString();
     setRiding(true);
@@ -1350,7 +1529,9 @@ function TripPlanner({ user, onLogout }) {
       150,
     );
     toast(
-      "In-app navigation started. Allow precise location for live guidance.",
+      window.isSecureContext
+        ? "In-app navigation started. Allow precise location for live guidance."
+        : "Navigation preview started. Live GPS requires HTTPS or localhost.",
     );
   };
 
@@ -2701,8 +2882,16 @@ function TripPlanner({ user, onLogout }) {
                     : gpsStatus === "requesting"
                       ? "CONNECTING GPS"
                       : gpsStatus === "denied"
-                        ? "ROUTE PREVIEW · GPS BLOCKED"
-                        : "ROUTE PREVIEW"}
+                        ? "LOCATION PERMISSION BLOCKED"
+                        : gpsStatus === "weak"
+                          ? "WAITING FOR ACCURATE GPS"
+                        : gpsStatus === "timeout"
+                          ? "GPS TIMEOUT · RETRYING"
+                          : gpsStatus === "unavailable"
+                            ? "GPS SIGNAL UNAVAILABLE"
+                            : gpsStatus === "insecure"
+                              ? "HTTPS REQUIRED FOR GPS"
+                              : "ROUTE PREVIEW · GPS UNSUPPORTED"}
                 </span>
                 <button onClick={stopNavigation}>
                   <X size={16} /> End

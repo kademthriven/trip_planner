@@ -2,6 +2,9 @@ const PHOTON_URL = "https://photon.komoot.io";
 const OSRM_URL = "https://router.project-osrm.org";
 const WEATHER_URL = "https://api.open-meteo.com/v1/forecast";
 const ELEVATION_URL = "https://api.open-meteo.com/v1/elevation";
+const GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search";
+const ARCGIS_GEOCODING_URL =
+  "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
 const VALHALLA_URL = "https://valhalla1.openstreetmap.de/route";
 const WIKIPEDIA_URL = "https://en.wikipedia.org/w/api.php";
 const OVERPASS_URLS = [
@@ -9,18 +12,37 @@ const OVERPASS_URLS = [
   "https://overpass.kumi.systems/api/interpreter",
 ];
 
+const geocodeCache = new Map();
+const routeCache = new Map();
+
+const remember = (cache, key, value, limit) => {
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, value);
+  if (cache.size > limit) cache.delete(cache.keys().next().value);
+  return value;
+};
+
 const fetchJson = async (url, options = {}, timeout = 18000) => {
   const controller = new AbortController();
+  const externalSignal = options.signal;
+  const abortFromCaller = () => controller.abort();
+  if (externalSignal?.aborted) controller.abort();
+  else externalSignal?.addEventListener("abort", abortFromCaller, {
+    once: true,
+  });
   const timer = window.setTimeout(() => controller.abort(), timeout);
+  const requestOptions = { ...options };
+  delete requestOptions.signal;
   try {
     const response = await fetch(url, {
-      ...options,
+      ...requestOptions,
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`Request failed (${response.status})`);
     return await response.json();
   } finally {
     window.clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", abortFromCaller);
   }
 };
 
@@ -400,45 +422,163 @@ export const DEFAULT_END = {
   lon: 77.6835,
 };
 
-export const geocode = async (query, bias) => {
+export const geocode = async (query, bias, { signal } = {}) => {
   if (!query?.trim()) return [];
-  const params = new URLSearchParams({
-    q: query.trim(),
+  const normalizedQuery = query.trim().replace(/\s+/g, " ");
+  const cacheKey = [
+    normalizedQuery.toLocaleLowerCase(),
+    bias?.lat?.toFixed?.(2) || "",
+    bias?.lon?.toFixed?.(2) || "",
+  ].join("|");
+  if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
+  const photonParams = new URLSearchParams({
+    q: normalizedQuery,
     limit: "5",
     lang: "en",
   });
   if (bias?.lat && bias?.lon) {
-    params.set("lat", bias.lat);
-    params.set("lon", bias.lon);
-    params.set("zoom", "10");
+    photonParams.set("lat", bias.lat);
+    photonParams.set("lon", bias.lon);
+    photonParams.set("zoom", "10");
   }
-  const data = await fetchJson(`${PHOTON_URL}/api/?${params}`);
-  return (data.features || []).map((feature) => {
-    const props = feature.properties || {};
-    const [lon, lat] = feature.geometry.coordinates;
-    const subtitle = [
-      props.district,
-      props.city,
-      props.county,
-      props.state,
-      props.country,
-    ]
-      .filter(Boolean)
-      .filter(
-        (value, index, array) =>
-          array.indexOf(value) === index && value !== props.name,
-      )
-      .slice(0, 3)
-      .join(", ");
-    return {
-      name: props.name || props.city || "Selected place",
-      subtitle,
-      lat,
-      lon,
-      osmType: props.osm_type,
-      osmId: props.osm_id,
-    };
+  const broadParams = new URLSearchParams({
+    name: normalizedQuery,
+    count: "5",
+    language: "en",
+    format: "json",
   });
+  const preciseParams = new URLSearchParams({
+    f: "json",
+    singleLine: normalizedQuery,
+    maxLocations: "5",
+    outFields: "PlaceName,Type,City,Region,Country",
+  });
+  if (bias?.lat && bias?.lon)
+    preciseParams.set("location", `${bias.lon},${bias.lat}`);
+  const photonController = new AbortController();
+  const broadController = new AbortController();
+  const preciseController = new AbortController();
+  const abortProviders = () => {
+    photonController.abort();
+    broadController.abort();
+    preciseController.abort();
+  };
+  if (signal?.aborted) abortProviders();
+  else signal?.addEventListener("abort", abortProviders, { once: true });
+
+  const requireResults = (promise) =>
+    promise.then((results) => {
+      if (!results.length) throw new Error("No matching places found.");
+      return results;
+    });
+  const detailedSearch = requireResults(
+    fetchJson(
+      `${PHOTON_URL}/api/?${photonParams}`,
+      { signal: photonController.signal },
+      7000,
+    ).then((data) =>
+      (data.features || []).map((feature) => {
+        const props = feature.properties || {};
+        const [lon, lat] = feature.geometry.coordinates;
+        const subtitle = [
+          props.district,
+          props.city,
+          props.county,
+          props.state,
+          props.country,
+        ]
+          .filter(Boolean)
+          .filter(
+            (value, index, array) =>
+              array.indexOf(value) === index && value !== props.name,
+          )
+          .slice(0, 3)
+          .join(", ");
+        return {
+          name: props.name || props.city || "Selected place",
+          subtitle,
+          lat,
+          lon,
+          osmType: props.osm_type,
+          osmId: props.osm_id,
+        };
+      }),
+    ),
+  );
+  const broadSearch = requireResults(
+    fetchJson(
+      `${GEOCODING_URL}?${broadParams}`,
+      { signal: broadController.signal },
+      5000,
+    ).then((data) =>
+      (data.results || []).map((place) => ({
+        name: place.name || "Selected place",
+        subtitle: [
+          place.admin3,
+          place.admin2,
+          place.admin1,
+          place.country,
+        ]
+          .filter(Boolean)
+          .filter(
+            (value, index, values) =>
+              values.indexOf(value) === index && value !== place.name,
+          )
+          .slice(0, 3)
+          .join(", "),
+        lat: place.latitude,
+        lon: place.longitude,
+      })),
+    ),
+  );
+  const preciseSearch = requireResults(
+    fetchJson(
+      `${ARCGIS_GEOCODING_URL}?${preciseParams}`,
+      { signal: preciseController.signal },
+      5000,
+    ).then((data) =>
+      (data.candidates || []).map((candidate) => {
+        const attributes = candidate.attributes || {};
+        const name =
+          attributes.PlaceName ||
+          candidate.address?.split(",")[0] ||
+          "Selected place";
+        return {
+          name,
+          subtitle: [
+            attributes.Type,
+            attributes.City,
+            attributes.Region,
+            attributes.Country,
+          ]
+            .filter(Boolean)
+            .filter(
+              (value, index, values) =>
+                values.indexOf(value) === index && value !== name,
+            )
+            .slice(0, 3)
+            .join(", "),
+          lat: candidate.location?.y,
+          lon: candidate.location?.x,
+        };
+      }),
+    ),
+  );
+
+  try {
+    const results = await Promise.any([
+      detailedSearch,
+      preciseSearch,
+      Promise.all([
+        broadSearch,
+        new Promise((resolve) => window.setTimeout(resolve, 500)),
+      ]).then(([results]) => results),
+    ]);
+    return remember(geocodeCache, cacheKey, results, 40);
+  } finally {
+    abortProviders();
+    signal?.removeEventListener("abort", abortProviders);
+  }
 };
 
 export const reverseGeocode = async (lat, lon) => {
@@ -586,7 +726,7 @@ const decodeValhallaShape = (encoded, precision = 6) => {
   return coordinates;
 };
 
-const getValhallaRoutes = async (start, end, settings) => {
+const getValhallaRoutes = async (start, end, settings, signal) => {
   const costing =
     settings.bikeId === "scooter" ? "motor_scooter" : "motorcycle";
   const variants =
@@ -616,8 +756,9 @@ const getValhallaRoutes = async (start, end, settings) => {
             units: "kilometers",
             directions_options: { units: "kilometers", narrative: true },
           }),
+          signal,
         },
-        28000,
+        14000,
       ),
     ),
   );
@@ -666,7 +807,7 @@ const getValhallaRoutes = async (start, end, settings) => {
   });
 };
 
-const getOsrmRoutes = async (start, end, settings) => {
+const getOsrmRoutes = async (start, end, settings, signal) => {
   const coords = `${start.lon},${start.lat};${end.lon},${end.lat}`;
   const params = new URLSearchParams({
     alternatives: "true",
@@ -676,8 +817,8 @@ const getOsrmRoutes = async (start, end, settings) => {
   });
   const data = await fetchJson(
     `${OSRM_URL}/route/v1/driving/${coords}?${params}`,
-    {},
-    25000,
+    { signal },
+    14000,
   );
   if (!data.routes?.length)
     throw new Error("No rideable route was found between those places.");
@@ -723,10 +864,38 @@ const getOsrmRoutes = async (start, end, settings) => {
 };
 
 export const getRoutes = async (start, end, settings) => {
+  const cacheKey = [
+    start.lat.toFixed(5),
+    start.lon.toFixed(5),
+    end.lat.toFixed(5),
+    end.lon.toFixed(5),
+    settings.bikeId,
+    settings.mileage,
+    settings.fuelPrice,
+  ].join("|");
+  if (routeCache.has(cacheKey)) return routeCache.get(cacheKey);
+
+  const valhallaController = new AbortController();
+  const osrmController = new AbortController();
+  const motorcycleRoutes = getValhallaRoutes(
+    start,
+    end,
+    settings,
+    valhallaController.signal,
+  );
+  const roadRoutes = Promise.all([
+    getOsrmRoutes(start, end, settings, osrmController.signal),
+    new Promise((resolve) => window.setTimeout(resolve, 1200)),
+  ]).then(([routes]) => routes);
+
   try {
-    return await getValhallaRoutes(start, end, settings);
+    const routes = await Promise.any([motorcycleRoutes, roadRoutes]);
+    return remember(routeCache, cacheKey, routes, 10);
   } catch {
-    return getOsrmRoutes(start, end, settings);
+    throw new Error("Live routing services are temporarily unavailable.");
+  } finally {
+    valhallaController.abort();
+    osrmController.abort();
   }
 };
 
