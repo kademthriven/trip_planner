@@ -25,3 +25,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Superseded local UI captures (the README uses rove-full-*.png)
+docs/screenshots/drift-*.png
+docs/screenshots/rove-planner.png
+docs/screenshots/rove-discovery.png
+docs/screenshots/rove-mobile.png
+docs/walkthrough-check-*.png

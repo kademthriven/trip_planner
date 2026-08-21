@@ -71,8 +71,9 @@ import {
 import AuthScreen from "./AuthScreen";
 import { clearSession, getSession, observeAuthState } from "./auth";
 import { loadRiderData, saveRiderData } from "./cloudStore";
-import { firebaseConfigured, firebaseModeLabel } from "./firebase";
+import { cognodbConfigured, cognodbModeLabel } from "./cognodb";
 import { generateItinerary } from "./itinerary";
+import { getCognoGraphJourney } from "./graphService";
 import {
   DEFAULT_END,
   DEFAULT_START,
@@ -204,9 +205,22 @@ const formatNavDistance = (kilometres) =>
     ? `${Math.max(10, Math.round((kilometres * 1000) / 10) * 10)} m`
     : `${kilometres.toFixed(kilometres < 10 ? 1 : 0)} km`;
 
-// Windows Wi-Fi positioning commonly settles just above 100 m even when the
-// returned coordinates are usable for choosing a road and starting a route.
-const MAX_LIVE_LOCATION_ACCURACY_METERS = 150;
+// Phones can usually provide a precise fix, while Windows laptops often use
+// Wi-Fi positioning. Keep the distinction visible instead of rejecting a
+// useful approximate location outright.
+const PRECISE_LOCATION_ACCURACY_METERS = 150;
+const MAX_USABLE_LOCATION_ACCURACY_METERS = 1000;
+
+const describeLiveLocation = (position) => {
+  const approximate =
+    !Number.isFinite(position.accuracy) ||
+    position.accuracy > PRECISE_LOCATION_ACCURACY_METERS;
+  return {
+    kind: approximate ? "approximate" : "precise",
+    title: approximate ? "Approximate live location" : "Live GPS location",
+    detail: `${position.lat.toFixed(5)}, ${position.lon.toFixed(5)} · ±${Math.round(position.accuracy || 0)} m`,
+  };
+};
 
 const createLocationError = (code, message, accuracy) =>
   Object.assign(new Error(message), { code, accuracy });
@@ -254,7 +268,7 @@ const readAccurateBrowserPosition = () =>
         }
         if (
           Number.isFinite(position.coords.accuracy) &&
-          position.coords.accuracy <= MAX_LIVE_LOCATION_ACCURACY_METERS
+          position.coords.accuracy <= MAX_USABLE_LOCATION_ACCURACY_METERS
         ) {
           finish(resolve, position);
         }
@@ -342,7 +356,7 @@ const diagnoseLocationError = async (error) => {
   if (Number.isFinite(error?.accuracy)) {
     return {
       title: "Waiting for accurate GPS",
-      detail: `The available fix is only accurate to ±${Math.round(error.accuracy)} m. A fix within ±${MAX_LIVE_LOCATION_ACCURACY_METERS} m is required before it can be used.`,
+      detail: `The available fix is only accurate to ±${Math.round(error.accuracy)} m. A fix within ±${MAX_USABLE_LOCATION_ACCURACY_METERS} m is required before it can be used.`,
     };
   }
   if (error?.code === 1 && permissionState === "granted") {
@@ -782,6 +796,7 @@ function TripPlanner({ user, onLogout }) {
       setActiveSearch(null);
       const requestId = ++placeLoadRef.current;
       const placePromise = getNearbyPlaces(to);
+      const graphPromise = getCognoGraphJourney(from, to, rideSettings);
       getDestinationPhoto(to)
         .then((photo) => {
           if (requestId === placeLoadRef.current) setDestinationPhoto(photo);
@@ -800,21 +815,27 @@ function TripPlanner({ user, onLogout }) {
         });
       try {
         let loadedRoutes = [fallbackRoute];
-        try {
-          loadedRoutes = await getRoutes(from, to, rideSettings);
-          if (requestId !== placeLoadRef.current) return;
-          setRoutes(loadedRoutes);
-          setSelectedId(loadedRoutes[0].id);
-        } catch {
-          if (requestId !== placeLoadRef.current) return;
+        const [roadResult, graphJourney] = await Promise.all([
+          getRoutes(from, to, rideSettings)
+            .then((value) => ({ value, failed: false }))
+            .catch(() => ({ value: [], failed: true })),
+          graphPromise,
+        ]);
+        if (requestId !== placeLoadRef.current) return;
+        loadedRoutes = graphJourney.routes.length
+          ? [...graphJourney.routes, ...roadResult.value].slice(0, 4)
+          : roadResult.value;
+        if (!loadedRoutes.length) {
           const previewRoute = createFallbackRoute(from, to, rideSettings);
           loadedRoutes = [previewRoute];
-          setRoutes([previewRoute]);
-          setSelectedId(previewRoute.id);
           setError(
             "Live routing is temporarily unavailable. Showing a preview line; try again shortly.",
           );
+        } else if (roadResult.failed && graphJourney.routes.length) {
+          setError("Road routing is temporarily unavailable. Showing verified CognoDB graph paths.");
         }
+        setRoutes(loadedRoutes);
+        setSelectedId(loadedRoutes[0].id);
         setEssentialsLoading(true);
         getRouteEssentials(loadedRoutes[0])
           .then((items) => {
@@ -836,9 +857,12 @@ function TripPlanner({ user, onLogout }) {
       } finally {
         if (requestId === placeLoadRef.current) setLoading(false);
       }
-      placePromise
-        .then((items) => {
+      Promise.all([placePromise.catch(() => []), graphPromise])
+        .then(([liveItems, graphJourney]) => {
           if (requestId !== placeLoadRef.current) return;
+          const items = [...graphJourney.places, ...liveItems].filter(
+            (place, index, all) => all.findIndex((item) => item.id === place.id) === index,
+          );
           setPlaces(items);
           setPlacesLoading(false);
           enrichPlacesWithPhotos(items, to).then((enriched) => {
@@ -874,11 +898,7 @@ function TripPlanner({ user, onLogout }) {
         setStart(liveOrigin.place);
         setStartText(liveOrigin.place.name);
         setCurrentPosition(liveOrigin.position);
-        setOriginStatus({
-          kind: "precise",
-          title: "Live GPS location",
-          detail: `${liveOrigin.position.lat.toFixed(5)}, ${liveOrigin.position.lon.toFixed(5)} · ±${Math.round(liveOrigin.position.accuracy || 0)} m`,
-        });
+        setOriginStatus(describeLiveLocation(liveOrigin.position));
         toast("Using your live location as the starting point.");
       } catch (gpsError) {
         if (!active) return;
@@ -893,7 +913,7 @@ function TripPlanner({ user, onLogout }) {
           title: gpsIssue.title,
           detail: `${gpsIssue.detail} Select your start manually or retry GPS.`,
         });
-        toast("An accurate device location was not available. Select the start manually or retry GPS.");
+        toast("A usable device location was not available. Select the start manually or retry GPS.");
       }
       if (active) loadTrip(origin, DEFAULT_END);
     };
@@ -957,7 +977,7 @@ function TripPlanner({ user, onLogout }) {
       (position) => {
         if (
           !Number.isFinite(position.coords.accuracy) ||
-          position.coords.accuracy > MAX_LIVE_LOCATION_ACCURACY_METERS
+          position.coords.accuracy > MAX_USABLE_LOCATION_ACCURACY_METERS
         ) {
           setGpsStatus("weak");
           if (lastGpsIssueRef.current !== "weak") {
@@ -968,8 +988,19 @@ function TripPlanner({ user, onLogout }) {
           }
           return;
         }
-        lastGpsIssueRef.current = null;
-        setGpsStatus("live");
+        const approximate =
+          position.coords.accuracy > PRECISE_LOCATION_ACCURACY_METERS;
+        setGpsStatus(approximate ? "approximate" : "live");
+        if (approximate) {
+          if (lastGpsIssueRef.current !== "approximate") {
+            toast(
+              `Using approximate live location (±${Math.round(position.coords.accuracy)} m).`,
+            );
+          }
+          lastGpsIssueRef.current = "approximate";
+        } else {
+          lastGpsIssueRef.current = null;
+        }
         setCurrentPosition({
           lat: position.coords.latitude,
           lon: position.coords.longitude,
@@ -1209,11 +1240,7 @@ function TripPlanner({ user, onLogout }) {
       setStart(liveOrigin.place);
       setStartText(liveOrigin.place.name);
       setCurrentPosition(liveOrigin.position);
-      setOriginStatus({
-        kind: "precise",
-        title: "Live GPS location",
-        detail: `${liveOrigin.position.lat.toFixed(5)}, ${liveOrigin.position.lon.toFixed(5)} · ±${Math.round(liveOrigin.position.accuracy || 0)} m`,
-      });
+      setOriginStatus(describeLiveLocation(liveOrigin.position));
       toast("Starting point updated from your live location.");
       loadTrip(liveOrigin.place, end);
     } catch (locationError) {
@@ -1271,9 +1298,9 @@ function TripPlanner({ user, onLogout }) {
       };
       setSavedTrips((trips) => [trip, ...trips].slice(0, 12));
       toast(
-        firebaseConfigured
-          ? "Trip saved to Firebase."
-          : "Trip saved in local demo mode.",
+        cognodbConfigured
+          ? "Trip saved to CognoDB."
+          : "CognoDB sync is unavailable.",
       );
     }
   };
@@ -1609,7 +1636,7 @@ function TripPlanner({ user, onLogout }) {
       <div className={`cloud-sync-bar ${cloudSync}`}>
         <span>
           <i />
-          {firebaseModeLabel}
+          {cognodbModeLabel}
         </span>
         <small>
           {cloudSync === "syncing"
@@ -2299,7 +2326,7 @@ function TripPlanner({ user, onLogout }) {
                   <ArrowLeft size={16} /> Back to plan
                 </button>
                 <p className="eyebrow">
-                  <Heart size={13} /> {firebaseModeLabel}
+                  <Heart size={13} /> {cognodbModeLabel}
                 </p>
                 <h1>Saved rides.</h1>
                 <p className="panel-intro">
@@ -2715,9 +2742,9 @@ function TripPlanner({ user, onLogout }) {
                         <Camera size={23} />
                         <strong>Add moments from your ride</strong>
                         <small>
-                          {firebaseConfigured
-                            ? "Stored securely in Firebase Storage."
-                            : "Stored locally until Firebase is configured."}
+                          {cognodbConfigured
+                            ? "Stored with your ride journal in CognoDB."
+                            : "Photo sync is temporarily unavailable."}
                         </small>
                         <input
                           type="file"
@@ -2879,6 +2906,8 @@ function TripPlanner({ user, onLogout }) {
                   <Radio size={12} />
                   {gpsStatus === "live"
                     ? `GPS LIVE${currentPosition?.accuracy ? ` · ±${Math.round(currentPosition.accuracy)} m` : ""}`
+                    : gpsStatus === "approximate"
+                      ? `GPS APPROXIMATE${currentPosition?.accuracy ? ` · ±${Math.round(currentPosition.accuracy)} m` : ""}`
                     : gpsStatus === "requesting"
                       ? "CONNECTING GPS"
                       : gpsStatus === "denied"
@@ -3325,7 +3354,7 @@ function TripPlanner({ user, onLogout }) {
             <div className={`cloud-sync-bar account-cloud ${cloudSync}`}>
               <span>
                 <i />
-                {firebaseModeLabel}
+                {cognodbModeLabel}
               </span>
               <small>
                 {cloudSync === "syncing"
@@ -3362,9 +3391,9 @@ function TripPlanner({ user, onLogout }) {
               <LogOut size={16} /> Log out
             </button>
             <p className="honesty-note">
-              {firebaseConfigured
-                ? "Authentication, trips, journals and photos sync through your Firebase project."
-                : "Add Firebase environment values to enable cloud authentication and cross-device sync."}
+              {cognodbConfigured
+                ? "Accounts, trips, journals and photo data sync through CognoDB."
+                : "Add CognoDB environment values to enable cloud data."}
             </p>
           </section>
         </div>
@@ -3627,10 +3656,8 @@ function TripPlanner({ user, onLogout }) {
 }
 
 function App() {
-  const [user, setUser] = useState(() =>
-    firebaseConfigured ? null : getSession(),
-  );
-  const [authReady, setAuthReady] = useState(!firebaseConfigured);
+  const [user, setUser] = useState(() => getSession());
+  const [authReady, setAuthReady] = useState(false);
   useEffect(
     () =>
       observeAuthState((currentUser) => {
@@ -3643,7 +3670,7 @@ function App() {
     return (
       <main className="auth-loading">
         <span className="mini-spinner" />
-        <strong>Connecting to Firebase…</strong>
+        <strong>Connecting to CognoDB…</strong>
       </main>
     );
   if (!user) return <AuthScreen onAuthenticated={setUser} />;

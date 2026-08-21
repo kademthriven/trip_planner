@@ -13,7 +13,7 @@ import {
   UserRound,
 } from "lucide-react";
 import { loginUser, registerUser } from "./auth";
-import { firebaseConfigured } from "./firebase";
+import { cognodbConfigured } from "./cognodb";
 
 function AuthScreen({ onAuthenticated }) {
   const [mode, setMode] = useState("login");
@@ -108,9 +108,9 @@ function AuthScreen({ onAuthenticated }) {
               </i>
               <b>Your plans, kept private</b>
               <small>
-                {firebaseConfigured
-                  ? "Synced securely through Firebase"
-                  : "Local demo mode until Firebase is configured"}
+                {cognodbConfigured
+                  ? "Trips and rider data sync through CognoDB"
+                  : "CognoDB connection is unavailable"}
               </small>
             </span>
           </div>
@@ -232,12 +232,12 @@ function AuthScreen({ onAuthenticated }) {
             <ArrowRight size={16} />
           </button>
           <p
-            className={`auth-privacy ${firebaseConfigured ? "cloud-ready" : ""}`}
+            className={`auth-privacy ${cognodbConfigured ? "cloud-ready" : ""}`}
           >
             <ShieldCheck size={13} />{" "}
-            {firebaseConfigured
-              ? "Firebase Authentication protects your account and syncs trips across devices."
-              : "Local demo mode is active. Add Firebase values to .env.local to enable cloud accounts."}
+            {cognodbConfigured
+              ? "Your rider account and trip data are stored in the CognoDB graph."
+              : "Connect CognoDB to enable rider accounts and trip sync."}
           </p>
         </form>
       </section>
