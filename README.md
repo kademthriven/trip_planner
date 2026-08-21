@@ -2,6 +2,8 @@
 
 Rove is a full motorcycle trip planner backed by CognoDB. It combines live GPS navigation, India-first place search, road routing, weather, elevation, budgets, groups, expenses, saved rides, journals, and real destination photography with graph-native route discovery and explainable recommendations.
 
+**[Open the hosted application](https://trip-planner-t4ln.onrender.com)** · [Watch the narrated walkthrough](docs/rove-cognodb-walkthrough.webm)
+
 ![Rove live planner with a CognoDB route from Bengaluru to Nandi Hills](docs/screenshots/rove-full-planner.png)
 
 | Desktop planner | Responsive live map |
@@ -203,7 +205,7 @@ Run `npm run seed` once against the production CognoDB instance. The deployed HT
 ## Submission links
 
 - Repository: [github.com/kademthriven/trip_planner](https://github.com/kademthriven/trip_planner)
-- Hosted demo: added after deployment
+- Hosted demo: [trip-planner-t4ln.onrender.com](https://trip-planner-t4ln.onrender.com)
 - 60–90 second walkthrough: [watch or download the repository recording](docs/rove-cognodb-walkthrough.webm)
 
 ## Assignment checklist
@@ -219,7 +221,7 @@ Run `npm run seed` once against the production CognoDB instance. The deployed HT
 - [x] Environment-only database credentials
 - [x] UI screenshots, tests, and deployment configuration
 - [x] Push to GitHub and add the repository URL
-- [ ] Deploy and add the hosted application URL
+- [x] Deploy and add the hosted application URL
 - [x] Record a 60–90 second walkthrough
 
 ## Suggested walkthrough
